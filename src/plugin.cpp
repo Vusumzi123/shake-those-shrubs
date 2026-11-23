@@ -27,6 +27,8 @@ namespace
 		float      maxImpact = 1.0F;                 // strength at full speed
 		float      impactSpeed = 350.0F;             // player speed giving full gain
 		float      velocityInfluence = 1.0F;        // 0 = velocity ignored, 1 = full velocity scaling
+		float      retriggerCooldown = 0.5F;        // seconds between repeats while still touched
+		float      moveThreshold = 20.0F;           // speed below which a held contact does not repeat
 		float      soundVolume = 1.0F;               // multiplier on the velocity-scaled volume
 		bool       soundEnabled = true;
 		bool       debug = false;
@@ -42,6 +44,7 @@ namespace
 		bool          touching = false;
 		bool          wasTouching = false;
 		float         gain = 1.0F;
+		float         cooldown = 0.0F;
 	};
 
 	std::vector<Sway> g_sways;
@@ -133,6 +136,8 @@ namespace
 		g_config.maxImpact = number("MaxImpact", 1.0F, 0.0F, 2.0F);
 		g_config.impactSpeed = number("ImpactSpeed", 350.0F, 50.0F, 900.0F);
 		g_config.velocityInfluence = number("VelocityInfluence", 1.0F, 0.0F, 1.0F);
+		g_config.retriggerCooldown = number("RetriggerCooldown", 0.5F, 0.1F, 5.0F);
+		g_config.moveThreshold = number("MoveThreshold", 20.0F, 0.0F, 1000.0F);
 		g_config.soundVolume = number("SoundVolume", 1.0F, 0.0F, 1.0F);
 		g_config.soundEnabled = flag("SoundEnabled", true);
 		g_config.debug = flag("Debug", false);
@@ -222,12 +227,20 @@ namespace
 			if (it == g_sways.end()) {
 				g_sways.push_back(Sway{ .refID = id, .gain = gain });
 				it = g_sways.end() - 1;
+				it->cooldown = g_config.retriggerCooldown;
 				SKSE::log::info("enter ref {:08X} flat {:.0f} speed {:.0f} gain {:.2f}", id, distance, speed, gain);
 				PlayImpact(gain);
 			} else if (!it->wasTouching) {
 				it->gain = gain;
 				it->wobbleTime = 0.0F;
+				it->cooldown = g_config.retriggerCooldown;
 				SKSE::log::info("re-enter ref {:08X} speed {:.0f} gain {:.2f}", id, speed, gain);
+				PlayImpact(gain);
+			} else if (speed >= g_config.moveThreshold && it->cooldown <= 0.0F) {
+				it->gain = gain;
+				it->wobbleTime = 0.0F;
+				it->cooldown = g_config.retriggerCooldown;
+				SKSE::log::info("retrigger ref {:08X} speed {:.0f} gain {:.2f}", id, speed, gain);
 				PlayImpact(gain);
 			}
 
@@ -243,6 +256,9 @@ namespace
 			if (!node) {
 				it = g_sways.erase(it);
 				continue;
+			}
+			if (it->cooldown > 0.0F) {
+				it->cooldown = (std::max)(0.0F, it->cooldown - a_delta);
 			}
 
 			if (!it->captured) {
@@ -346,6 +362,8 @@ namespace
 			g_slider("Velocity impact", &g_config.velocityInfluence, 0.0F, 1.0F, "%.2f", 0);
 			g_slider("Strength at zero speed", &g_config.minImpact, 0.0F, 2.0F, "%.2f", 0);
 			g_slider("Strength at full speed", &g_config.maxImpact, 0.0F, 2.0F, "%.2f", 0);
+			g_slider("Repeat cooldown", &g_config.retriggerCooldown, 0.1F, 5.0F, "%.2f", 0);
+			g_slider("Move threshold", &g_config.moveThreshold, 0.0F, 1000.0F, "%.0f", 0);
 			g_slider("Speed for full shake", &g_config.impactSpeed, 50.0F, 900.0F, "%.0f", 0);
 			g_slider("Sound volume", &g_config.soundVolume, 0.0F, 1.0F, "%.2f", 0);
 			if (g_checkbox) {
