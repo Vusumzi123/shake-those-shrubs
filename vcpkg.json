@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "shake-those-shrubs",
+  "version-semver": "0.1.0",
+  "description": "SKSE plugin: sound and sway when the player brushes a pine shrub.",
+  "license": "GPL-3.0-or-later",
+  "dependencies": [
+    "directxmath",
+    "directxtk",
+    "fmt",
+    "nlohmann-json",
+    "rapidcsv",
+    "simpleini",
+    "spdlog",
+    "toml11",
+    "xbyak"
+  ]
+}
