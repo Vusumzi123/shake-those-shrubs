@@ -37,6 +37,8 @@ page edits the live values.
 | `MaxImpact` | `1.0` | Shake strength at full speed. |
 | `VelocityInfluence` | `1.0` | `1` maps strength across the speed range, `0` always uses full-speed strength. |
 | `ImpactSpeed` | `350` | Speed considered "full". |
+| `RetriggerCooldown` | `0.5` | Seconds between repeats while you stay in contact and keep moving (clamped to 0.1 minimum). |
+| `MoveThreshold` | `20` | Speed below which a held contact does not repeat; standing still stays silent. |
 | `YawDegrees` / `PitchDegrees` | | Tilt limits at strength 1. |
 | `Speed` / `Spring` | | Wobble frequency and decay. |
 | `LeanFraction` / `LeanRate` | | How far the shrub leans and how quickly it reaches it. |
