@@ -1,20 +1,37 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
+#include <set>
+#include <unordered_set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <algorithm>
 #include <windows.h>
+
+#include "RE/T/TESDataHandler.h"
+#include "RE/T/TESFlora.h"
+#include "RE/T/TESModel.h"
+#include "RE/T/TESObjectACTI.h"
+#include "RE/T/TESObjectSTAT.h"
+#include "RE/T/TESObjectTREE.h"
+#include "RE/T/TESProduceForm.h"
 
 namespace
 {
 	struct Config
 	{
-		RE::FormID targetRef = 0;                    // 0 = nearest pine of BaseForm
+		RE::FormID targetRef = 0;                    // 0 = nearest matching shrub
 		RE::FormID baseForm = 0x0009DAA2;            // TreePineShrub01Snow
+		std::vector<std::string> tagEditorIDs;      // lowercase model path substrings
+		bool        harvestable = true;             // treat every harvestable plant base form as a shrub
+		std::vector<RE::FormID>   extraBaseForms;    // from BaseForms= and patch files
+		bool        dumpBaseForms = false;          // write the built set next to the INI
 		RE::FormID sound = 0x00000DD0;               // ITMGenericUpLoFi
 		float      radius = 90.0F;                   // horizontal game units
 		float      yawDegrees = 4.0F;
@@ -48,6 +65,9 @@ namespace
 	};
 
 	std::vector<Sway> g_sways;
+	std::unordered_set<RE::FormID> g_shrubBases;
+	std::set<RE::FormID> g_seenBases;
+	RE::FormID     g_seenCell = 0;
 
 	Config     g_config;
 	Sway       g_sway;
@@ -71,12 +91,15 @@ namespace
 		return static_cast<RE::FormID>(std::strtoul(std::string(a_value).c_str(), nullptr, 16));
 	}
 
-	void LoadConfig()
+	std::map<std::string, std::string> ReadValues(const char* a_path)
 	{
 		std::map<std::string, std::string> values;
-		std::ifstream file("Data/SKSE/Plugins/ShakeThoseShrubs.ini");
+		std::ifstream file(a_path);
 		std::string   line;
 		while (std::getline(file, line)) {
+			if (line.size() >= 3 && line[0] == '\xEF' && line[1] == '\xBB' && line[2] == '\xBF') {
+				line.erase(0, 3);
+			}
 			if (!line.empty() && line.back() == '\r') {
 				line.pop_back();
 			}
@@ -101,7 +124,65 @@ namespace
 			}
 			values[key] = value;
 		}
+		return values;
+	}
 
+	void AppendFormList(std::vector<RE::FormID>& a_out, std::string a_list)
+	{
+		while (!a_list.empty()) {
+			const auto comma = a_list.find(',');
+			std::string token = a_list.substr(0, comma);
+			a_list = comma == std::string::npos ? "" : a_list.substr(comma + 1);
+			const auto begin = token.find_first_not_of(" \t");
+			const auto end = token.find_last_not_of(" \t");
+			token = begin == std::string::npos ? "" : token.substr(begin, end - begin + 1);
+			if (!token.empty()) {
+				if (const auto id = ParseFormID(token); id != 0) {
+					a_out.push_back(id);
+				} else {
+					SKSE::log::warn("BaseForms entry '{}' did not resolve", token);
+				}
+			}
+		}
+	}
+
+	void LoadPatches()
+	{
+		namespace fs = std::filesystem;
+		const char* dir = "Data/SKSE/Plugins/ShakeThoseShrubsPatches";
+		std::error_code ec;
+		if (!fs::is_directory(dir, ec)) {
+			return;
+		}
+		std::size_t files = 0;
+		try {
+			for (const auto& entry : fs::directory_iterator(dir)) {
+				std::error_code entryEc;
+				std::string     ext = entry.path().extension().string();
+				for (auto& c : ext) {
+					c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+				}
+				if (!entry.is_regular_file(entryEc) || entryEc || ext != ".ini") {
+					continue;
+				}
+				const auto values = ReadValues(entry.path().string().c_str());
+				const auto it = values.find("BaseForms");
+				if (it != values.end()) {
+					AppendFormList(g_config.extraBaseForms, it->second);
+					++files;
+				}
+			}
+		} catch (const std::exception& e) {
+			SKSE::log::warn("patch scan failed: {}", e.what());
+		}
+		if (files > 0) {
+			SKSE::log::info("read BaseForms from {} patch file(s)", files);
+		}
+	}
+
+	void LoadConfig()
+	{
+		auto values = ReadValues("Data/SKSE/Plugins/ShakeThoseShrubs.ini");
 		if (values.empty()) {
 			SKSE::log::warn("ShakeThoseShrubs.ini missing or empty, using defaults");
 		}
@@ -124,6 +205,25 @@ namespace
 
 		g_config.targetRef = ParseFormID(get("TargetRef", "0"));
 		g_config.baseForm = ParseFormID(get("BaseForm", "0x0009DAA2"));
+		g_config.harvestable = flag("Harvestable", true);
+		g_config.dumpBaseForms = flag("DumpBaseForms", false);
+		AppendFormList(g_config.extraBaseForms, get("BaseForms", ""));
+		const auto tagIt = values.find("TagEditorID");
+		std::string tagList = tagIt == values.end() ? "Shrub,Bush,Fern,Thistle,Brush" : tagIt->second;
+		while (!tagList.empty()) {
+			const auto comma = tagList.find(',');
+			std::string token = tagList.substr(0, comma);
+			tagList = comma == std::string::npos ? "" : tagList.substr(comma + 1);
+			const auto begin = token.find_first_not_of(" \t");
+			const auto end = token.find_last_not_of(" \t");
+			token = begin == std::string::npos ? "" : token.substr(begin, end - begin + 1);
+			for (auto& c : token) {
+				c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+			}
+			if (!token.empty()) {
+				g_config.tagEditorIDs.push_back(token);
+			}
+		}
 		g_config.sound = ParseFormID(get("Sound", "0x00000DD0"));
 		g_config.radius = number("Radius", 90.0F, 10.0F, 400.0F);
 		g_config.yawDegrees = number("YawDegrees", 4.0F, 0.0F, 25.0F);
@@ -141,6 +241,7 @@ namespace
 		g_config.soundVolume = number("SoundVolume", 1.0F, 0.0F, 1.0F);
 		g_config.soundEnabled = flag("SoundEnabled", true);
 		g_config.debug = flag("Debug", false);
+		LoadPatches();
 	}
 
 	float FlatDistance(const RE::NiPoint3& a_a, const RE::NiPoint3& a_b)
@@ -174,6 +275,118 @@ namespace
 		SKSE::log::info("sound vol {:.2f}", volume);
 	}
 
+	bool MatchesTag(RE::TESForm* a_base)
+	{
+		if (g_config.tagEditorIDs.empty()) {
+			return false;
+		}
+		const auto* model = a_base->As<RE::TESModel>();
+		if (!model || !model->GetModel()) {
+			return false;
+		}
+		std::string haystack{ model->GetModel() };
+		for (auto& c : haystack) {
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+		for (const auto& token : g_config.tagEditorIDs) {
+			if (haystack.find(token) != std::string::npos) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool IsHarvestable(RE::TESForm* a_base)
+	{
+		if (a_base->GetFormType() == RE::FormType::Flora) {
+			return true;
+		}
+		auto* produce = a_base->As<RE::TESProduceForm>();
+		return produce && produce->produceItem;
+	}
+
+	bool IsCandidateType(RE::TESForm* a_base)
+	{
+		if (!a_base) {
+			return false;
+		}
+		switch (a_base->GetFormType()) {
+		case RE::FormType::Static:
+		case RE::FormType::Tree:
+		case RE::FormType::Flora:
+		case RE::FormType::Activator:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	bool IsShrub(RE::TESForm* a_base)
+	{
+		return a_base && g_shrubBases.contains(a_base->GetFormID());
+	}
+
+	void BuildShrubBases()
+	{
+		g_shrubBases.clear();
+		auto* handler = RE::TESDataHandler::GetSingleton();
+		if (!handler) {
+			return;
+		}
+
+		const auto add = [](RE::TESForm* a_form) {
+			if (!a_form) {
+				return;
+			}
+			if (a_form->GetFormID() == g_config.baseForm || (g_config.harvestable && IsHarvestable(a_form)) || MatchesTag(a_form)) {
+				g_shrubBases.insert(a_form->GetFormID());
+			}
+		};
+		for (auto* form : handler->GetFormArray<RE::TESObjectSTAT>()) {
+			add(form);
+		}
+		for (auto* form : handler->GetFormArray<RE::TESObjectTREE>()) {
+			add(form);
+		}
+		for (auto* form : handler->GetFormArray<RE::TESFlora>()) {
+			add(form);
+		}
+		for (auto* form : handler->GetFormArray<RE::TESObjectACTI>()) {
+			add(form);
+		}
+		for (const auto id : g_config.extraBaseForms) {
+			if (auto* form = RE::TESForm::LookupByID(id)) {
+				g_shrubBases.insert(form->GetFormID());
+			} else {
+				SKSE::log::warn("BaseForms {:08X} does not resolve to a loaded form", id);
+			}
+		}
+		if (g_config.baseForm != 0) {
+			if (auto* form = RE::TESForm::LookupByID(g_config.baseForm)) {
+				g_shrubBases.insert(form->GetFormID());
+			} else {
+				SKSE::log::warn("BaseForm {:08X} does not resolve to a loaded form", g_config.baseForm);
+			}
+		}
+		SKSE::log::info("{} base forms match", g_shrubBases.size());
+
+		if (!g_config.dumpBaseForms) {
+			return;
+		}
+		std::ofstream out("Data/SKSE/Plugins/ShakeThoseShrubs_bases.txt");
+		if (!out) {
+			SKSE::log::warn("could not write ShakeThoseShrubs_bases.txt");
+			return;
+		}
+		for (const auto id : g_shrubBases) {
+			auto* form = RE::TESForm::LookupByID(id);
+			const auto* model = form ? form->As<RE::TESModel>() : nullptr;
+			const char* path = model ? model->GetModel() : nullptr;
+			out << std::format("{:08X} {}\n", id, path ? path : "");
+		}
+		SKSE::log::info("base form dump written");
+	}
+
 	void Poll()
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
@@ -181,6 +394,11 @@ namespace
 		if (!cell) {
 			g_sways.clear();
 			return;
+		}
+
+		if (cell->GetFormID() != g_seenCell) {
+			g_seenCell = cell->GetFormID();
+			g_seenBases.clear();
 		}
 
 		const auto scan = g_config.radius + 128.0F;
@@ -192,19 +410,35 @@ namespace
 			if (ref && ref->Get3D() && FlatDistance(ref->GetPosition(), player->GetPosition()) <= g_config.radius) {
 				hits.push_back(ref);
 			}
-		} else if (g_config.baseForm != 0) {
+		} else if (!g_shrubBases.empty()) {
+			std::vector<std::pair<float, RE::TESObjectREFR*>> candidates;
 			cell->ForEachReferenceInRange(player->GetPosition(), scan, [&](RE::TESObjectREFR* a_ref) {
-				if (!a_ref || !a_ref->Get3D() || !a_ref->GetBaseObject() || a_ref->GetBaseObject()->GetFormID() != g_config.baseForm) {
+				if (!a_ref || !a_ref->Get3D()) {
 					return RE::BSContainer::ForEachResult::kContinue;
 				}
-				if (FlatDistance(a_ref->GetPosition(), player->GetPosition()) > g_config.radius) {
+				const auto distance = FlatDistance(a_ref->GetPosition(), player->GetPosition());
+				if (distance > g_config.radius) {
 					return RE::BSContainer::ForEachResult::kContinue;
 				}
-				if (hits.size() < 8) {
-					hits.push_back(a_ref);
+				auto* base = a_ref->GetBaseObject();
+				if (!IsShrub(base)) {
+					if (g_config.debug && IsCandidateType(base) && g_seenBases.size() < 64 && g_seenBases.insert(base->GetFormID()).second) {
+						auto* model = base->As<RE::TESModel>();
+						const char* modelPath = model ? model->GetModel() : nullptr;
+						SKSE::log::info("near base {:08X} model '{}'", base->GetFormID(), modelPath ? modelPath : "");
+					}
+					return RE::BSContainer::ForEachResult::kContinue;
 				}
+				candidates.emplace_back(distance, a_ref);
 				return RE::BSContainer::ForEachResult::kContinue;
 			});
+			std::sort(candidates.begin(), candidates.end(), [](const auto& a_left, const auto& a_right) { return a_left.first < a_right.first; });
+			for (const auto& [distance, ref] : candidates) {
+				if (hits.size() >= 8) {
+					break;
+				}
+				hits.push_back(ref);
+			}
 		}
 
 		for (auto& sway : g_sways) {
@@ -399,6 +633,7 @@ namespace
 		}
 
 		LoadConfig();
+		BuildShrubBases();
 		SKSE::log::info("Shake Those Shrubs ready: base {:08X}, ref {:08X}, sound {:08X}, radius {:.0f}",
 			g_config.baseForm, g_config.targetRef, g_config.sound, g_config.radius);
 
